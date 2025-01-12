@@ -1,0 +1,277 @@
+version: '3.9'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - app_network
+    healthcheck:
+      test: nc -z localhost 2181
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+    ports:
+      - "9092:9092"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: kafdrop
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+    ports:
+      - "9000:9000"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  spark-master:
+    image: bitnami/spark:latest
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - JAVA_HOME=/usr/lib/jvm/java-8-openjdk
+      - PATH=/usr/lib/jvm/java-8-openjdk/bin:$PATH
+    ports:
+      - "8081:8081"
+    networks:
+      - app_network
+    volumes:
+      - spark-master-data:/tmp/spark
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  spark-worker:
+    image: bitnami/spark:latest
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+    depends_on:
+      - spark-master
+    networks:
+      - app_network
+    volumes:
+      - spark-worker-data:/tmp/spark
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://spark-master:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  spark-history-server:
+    image: bitnami/spark:latest
+    container_name: spark-history-server
+    environment:
+      - SPARK_MODE=master
+      - SPARK_HISTORY_FS_LOGDIRECTORY=/tmp/spark-events
+    ports:
+      - "18080:18080"
+    volumes:
+      - ./spark-events:/tmp/spark-events
+      - spark-history-server-data:/tmp/spark
+    networks:
+      - app_network
+    depends_on:
+      - spark-master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18080"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile  # Указание на созданный Dockerfile
+    image: apache/airflow:2.6.1
+    container_name: airflow-webserver
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags  # Локальная папка ./dags будет доступна в контейнере по пути /opt/airflow/dags
+      - airflow_data:/opt/airflow  # Volume для данных
+    networks:
+      - app_network
+    command: >
+      bash -c "
+      airflow db upgrade &&
+      airflow webserver"
+    healthcheck:
+      test: ["CMD-SHELL", "airflow db check"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile  # Указание на созданный Dockerfile
+    image: apache/airflow:2.6.1
+    container_name: airflow-scheduler
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    depends_on:
+      - postgres
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags  # Локальная папка ./dags будет доступна в контейнере по пути /opt/airflow/dags
+      - airflow_data:/opt/airflow  # Volume для данных
+    networks:
+      - app_network
+    command: >
+      bash -c "
+      airflow db upgrade &&
+      airflow scheduler"
+    healthcheck:
+      test: ["CMD-SHELL", "airflow db check"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mysql:
+    image: mysql:latest
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: test_db
+      MYSQL_USER: test_user
+      MYSQL_PASSWORD: test_password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - "3000:3000"
+    networks:
+      - app_network
+    depends_on:
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  jupyter:
+    image: jupyter/base-notebook:latest
+    container_name: jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  mongodb:
+    image: mongo:latest
+    container_name: mongodb
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=rootpassword
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "mongo", "--eval", "db.runCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  postgres_data:
+  mysql_data:
+  airflow_data:
+  spark_data:
+  spark-master-data:
+  spark-worker-data:
+  spark-history-server-data:
+  mongodb_data:
+
+networks:
+  app_network:
